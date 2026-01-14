@@ -48,7 +48,16 @@ dataset/hust/
 └── OB504.mat
 ```
 
+## 🚀 Usage
 
+Scenario I: Single Unseen Target (XJTU Dataset)
+Please use main_gzsl_xjtu.py to train the PGCD for single compound fault (IOB) diagnosis using XJTU dataset.
+The results (Seen Acc, Unseen Acc and H-score) will also be given.
+
+Scenario II: Multiple Unseen Targets (HUST Dataset).
+Please use main_gzsl_hust.py to train the PGCD for single compound fault (IOB) diagnosis using HUST dataset. 
+Then use hust_gzsl_sp_model.py to train the spelialist model.
+Finally use the hust_gzsl_sp_model_confidence.py to get the results (Seen Acc, Unseen Acc and H-score).
 
 
 
