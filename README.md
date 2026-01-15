@@ -21,7 +21,7 @@ Key innovations include:
 
 ## 💾 Data Preparation
 
-1. XJTU Gearbox Dataset
+### 1. XJTU Gearbox Dataset
 Download the dataset from the XJTU Website and organize files as follows:
 
 ```bash
@@ -35,7 +35,7 @@ dataset/xjtu/
 └── 1ndBearing_mix(inner+outer+ball)/ 
     └── Data_Chan1.txt
 ```
-2. HUST Bearing Dataset
+### 2. HUST Bearing Dataset
 Download the dataset and organize files as follows:
 
 ```bash
@@ -50,17 +50,19 @@ dataset/hust/
 
 ## 🚀 Usage
 
-Scenario I: Single Unseen Target (XJTU Dataset)
+### Scenario I: Single Unseen Target (XJTU Dataset)
 
 Please use main_gzsl_xjtu.py to train the PGCD for single compound fault (IOB) diagnosis using XJTU dataset.
 
 The results (Seen Acc, Unseen Acc and H-score) will also be given.
 
 
-Scenario II: Multiple Unseen Targets (HUST Dataset).
+### Scenario II: Multiple Unseen Targets (HUST Dataset).
 
 Please use main_gzsl_hust.py to train the PGCD for single compound fault (IOB) diagnosis using HUST dataset. 
+
 Then use hust_gzsl_sp_model.py to train the spelialist model.
+
 Finally use the hust_gzsl_sp_model_confidence.py to get the results (Seen Acc, Unseen Acc and H-score).
 
 
