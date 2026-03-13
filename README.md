@@ -28,6 +28,8 @@ This repository contains the code for the **PGCD-CRE** framework, a novel genera
 ├── dataset/
 │   ├── xjtu/                   # Place XJTU planetary gearbox dataset here
 │   └── hust/                   # Place HUST bearing dataset here
+├── causal_diffusion_model.py   # PGCD model file
+├── data_loader.py              # Data loader for XJTU and HUST
 ├── main_gzsl_xjtu.py           # End-to-end training & evaluation for XJTU dataset
 ├── main_gzsl_hust.py           # PGCD generation phase for HUST dataset
 ├── hust_gzsl_sp_model.py       # Specialist model training for HUST dataset
