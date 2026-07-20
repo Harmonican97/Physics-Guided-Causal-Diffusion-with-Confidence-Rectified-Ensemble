@@ -1,122 +1,160 @@
 import os
-import torch
+
 import numpy as np
-import pandas as pd
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+
+SPLIT_RATIOS = (0.60, 0.20, 0.20)
+
+
+def _temporal_block(raw_signal, split):
+    """Split the continuous trace before windowing to prevent leakage."""
+    n = len(raw_signal)
+    train_end = int(SPLIT_RATIOS[0] * n)
+    val_end = int((SPLIT_RATIOS[0] + SPLIT_RATIOS[1]) * n)
+    if split == 'train':
+        return raw_signal[:train_end]
+    if split == 'val':
+        return raw_signal[train_end:val_end]
+    if split == 'test':
+        return raw_signal[val_end:]
+    raise ValueError(f"Unsupported split: {split}")
+
+
+def _segment(block, signal_len, stride):
+    n_windows = (len(block) - signal_len) // stride + 1
+    if n_windows <= 0:
+        return np.empty((0, signal_len), dtype=np.float32)
+    starts = np.arange(n_windows)[:, None] * stride
+    offsets = np.arange(signal_len)[None, :]
+    return block[starts + offsets].astype(np.float32, copy=False)
+
 
 class XJTUGearboxDataset(Dataset):
-    def __init__(self, root_dir='./dataset/xjtu', signal_len=1024, stride=None, mode='seen', normalize=True, force_reload=False):
-        """
-        Args:
-            root_dir (str)
-            signal_len (int)
-            stride (int)
-            mode (str)
-            normalize (bool)
-            force_reload (bool)
-        """
+    """Strict temporal-block XJTU dataset.
+
+    Normalization statistics are computed once from the first 60% of the
+    *seen* single-fault traces and reused for validation, seen test, and real
+    unseen test data. Real compound-fault samples are exposed only through
+    ``mode='unseen', split='test'``.
+    """
+
+    folder_map = {
+        'ball': {'folder': '1ndBearing_ball', 'label': 0, 'type': 'seen'},
+        'inner': {'folder': '1ndBearing_inner', 'label': 1, 'type': 'seen'},
+        'outer': {'folder': '1ndBearing_outer', 'label': 2, 'type': 'seen'},
+        'mix': {
+            'folder': '1ndBearing_mix(inner+outer+ball)',
+            'label': 3,
+            'type': 'unseen',
+        },
+    }
+
+    def __init__(
+        self,
+        root_dir='./dataset/xjtu',
+        signal_len=1024,
+        stride=None,
+        mode='seen',
+        split='train',
+        normalize=True,
+        force_reload=False,
+    ):
         self.root_dir = root_dir
-        self.signal_len = signal_len
-        self.stride = stride if stride is not None else signal_len
+        self.signal_len = int(signal_len)
+        self.stride = int(stride if stride is not None else signal_len)
         self.mode = mode
+        self.split = split
         self.normalize = normalize
-        
-        self.cache_dir = os.path.join(root_dir, 'processed_cache')
-        os.makedirs(self.cache_dir, exist_ok=True)
-        self.cache_file = os.path.join(self.cache_dir, f'xjtu_data_len{signal_len}_stride{self.stride}_norm{normalize}.pt')
 
-        self.folder_map = {
-            'ball':  {'folder': '1ndBearing_ball',                 'label': 0, 'type': 'seen'},
-            'inner': {'folder': '1ndBearing_inner',                'label': 1, 'type': 'seen'},
-            'outer': {'folder': '1ndBearing_outer',                'label': 2, 'type': 'seen'},
-            'mix':   {'folder': '1ndBearing_mix(inner+outer+ball)','label': 3, 'type': 'unseen'}
+        if mode not in {'seen', 'unseen'}:
+            raise ValueError("mode must be 'seen' or 'unseen'")
+        if split not in {'train', 'val', 'test'}:
+            raise ValueError("split must be train/val/test")
+        if mode == 'unseen' and split != 'test':
+            self.data = torch.empty((0, 1, self.signal_len), dtype=torch.float32)
+            self.labels = torch.empty(0, dtype=torch.long)
+            self.normalization_stats = None
+            return
+
+        cache_dir = os.path.join(root_dir, 'processed_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        self.cache_file = os.path.join(
+            cache_dir,
+            f'xjtu_strict_temporal_v2_len{self.signal_len}_stride{self.stride}_norm{normalize}.pt',
+        )
+        if force_reload or not os.path.exists(self.cache_file):
+            payload = self._process_all_splits()
+            torch.save(payload, self.cache_file)
+        else:
+            payload = torch.load(self.cache_file, map_location='cpu')
+
+        self.normalization_stats = payload['normalization_stats']
+        selected_data, selected_labels = [], []
+        for key, info in self.folder_map.items():
+            if info['type'] != mode:
+                continue
+            data, labels = payload['splits'][split][key]
+            if len(data):
+                selected_data.append(data)
+                selected_labels.append(labels)
+
+        if selected_data:
+            self.data = torch.cat(selected_data, dim=0)
+            self.labels = torch.cat(selected_labels, dim=0)
+        else:
+            self.data = torch.empty((0, 1, self.signal_len), dtype=torch.float32)
+            self.labels = torch.empty(0, dtype=torch.long)
+
+    def _read_all_signals(self):
+        signals = {}
+        for key, info in self.folder_map.items():
+            path = os.path.join(self.root_dir, info['folder'], 'Data_Chan1.txt')
+            if not os.path.exists(path):
+                raise FileNotFoundError(f'Missing XJTU signal file: {path}')
+            # The distributed XJTU files contain a 15-line DASYLab acquisition
+            # header followed by one floating-point vibration value per line.
+            # Treating the whole file as a rectangular table fails because the
+            # header rows have different field counts.
+            signal = np.loadtxt(path, skiprows=15, dtype=np.float32)
+            signal = np.asarray(signal, dtype=np.float32).reshape(-1)
+            if signal.size <= self.signal_len or not np.isfinite(signal).all():
+                raise ValueError(f'Invalid XJTU vibration stream: {path}')
+            signals[key] = signal
+        return signals
+
+    def _process_all_splits(self):
+        signals = self._read_all_signals()
+        seen_train = np.concatenate(
+            [
+                _temporal_block(signals[key], 'train')
+                for key, info in self.folder_map.items()
+                if info['type'] == 'seen'
+            ]
+        )
+        mean = float(np.mean(seen_train))
+        std = float(np.std(seen_train) + 1e-8)
+
+        split_payload = {split: {} for split in ('train', 'val', 'test')}
+        for split in split_payload:
+            for key, info in self.folder_map.items():
+                if info['type'] == 'unseen' and split != 'test':
+                    windows = np.empty((0, self.signal_len), dtype=np.float32)
+                else:
+                    block = _temporal_block(signals[key], split)
+                    if self.normalize:
+                        block = (block - mean) / std
+                    windows = _segment(block, self.signal_len, self.stride)
+                data = torch.from_numpy(windows).unsqueeze(1)
+                labels = torch.full((len(data),), info['label'], dtype=torch.long)
+                split_payload[split][key] = (data, labels)
+
+        return {
+            'protocol': 'strict-temporal-60-20-20-before-windowing-v2',
+            'normalization_stats': {'mean': mean, 'std': std, 'source': 'seen-train-only'},
+            'splits': split_payload,
         }
-
-        if os.path.exists(self.cache_file) and not force_reload:
-            print(f"Loading data from cache: {self.cache_file} ...")
-            try:
-                self.all_data = torch.load(self.cache_file)
-                print("Cache loaded successfully.")
-            except Exception as e:
-                print(f"Error loading cache: {e}. Re-processing data...")
-                self._process_and_save()
-        else:
-            print(f"Cache not found or reload forced. Processing raw data from {root_dir}...")
-            self._process_and_save()
-
-        self._filter_data_by_mode()
-
-    def _process_and_save(self):
-        processed_data = {}
-        
-        for key, info in self.folder_map.items():
-            folder_name = info['folder']
-            file_path = os.path.join(self.root_dir, folder_name, 'Data_Chan1.txt')
-            
-            print(f"Processing {folder_name}...")
-            if not os.path.exists(file_path):
-                print(f"  [Warning] File not found: {file_path}")
-                processed_data[key] = (torch.empty(0), torch.empty(0))
-                continue
-            
-            try:
-                df = pd.read_csv(file_path, header=None, sep=r'\s+', engine='c')
-                raw_signal = df.values.flatten().astype(np.float32)
-            except Exception as e:
-                print(f"  [Error] Failed to read {file_path}: {e}")
-                continue
-                
-            if self.normalize:
-                mean = np.mean(raw_signal)
-                std = np.std(raw_signal)
-                raw_signal = (raw_signal - mean) / (std + 1e-8)
-                
-            n_samples = (len(raw_signal) - self.signal_len) // self.stride + 1
-            if n_samples <= 0:
-                print(f"  [Warning] Signal too short.")
-                continue
-                
-            indexer = np.arange(self.signal_len)[None, :] + np.arange(n_samples)[:, None] * self.stride
-            sliced_data = raw_signal[indexer]
-            
-            data_tensor = torch.from_numpy(sliced_data).unsqueeze(1).float()
-            
-            label_val = info['label']
-            labels_tensor = torch.full((n_samples,), label_val, dtype=torch.long)
-            
-            processed_data[key] = (data_tensor, labels_tensor)
-            print(f"  -> Generated {n_samples} samples.")
-            
-        print(f"Saving processed data to {self.cache_file}...")
-        torch.save(processed_data, self.cache_file)
-        self.all_data = processed_data
-
-    def _filter_data_by_mode(self):
-
-        data_list = []
-        labels_list = []
-        
-        for key, info in self.folder_map.items():
-            if self.mode == 'seen' and info['type'] == 'unseen':
-                continue
-            if self.mode == 'unseen' and info['type'] == 'seen':
-                continue
-            
-            if key in self.all_data:
-                d, l = self.all_data[key]
-                if len(d) > 0:
-                    data_list.append(d)
-                    labels_list.append(l)
-        
-        if len(data_list) > 0:
-            self.data = torch.cat(data_list, dim=0)
-            self.labels = torch.cat(labels_list, dim=0)
-            print(f"Mode '{self.mode}': Loaded {len(self.data)} samples.")
-        else:
-            self.data = torch.empty(0)
-            self.labels = torch.empty(0)
-            print(f"Mode '{self.mode}': No data found.")
 
     def __len__(self):
         return len(self.data)
@@ -124,48 +162,31 @@ class XJTUGearboxDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx], self.labels[idx]
 
+
+def get_temporal_dataloaders(root_dir, batch_size=64, signal_len=1024, num_workers=0):
+    common = dict(root_dir=root_dir, signal_len=signal_len, stride=signal_len)
+    train_ds = XJTUGearboxDataset(mode='seen', split='train', **common)
+    val_ds = XJTUGearboxDataset(mode='seen', split='val', **common)
+    seen_test_ds = XJTUGearboxDataset(mode='seen', split='test', **common)
+    unseen_test_ds = XJTUGearboxDataset(mode='unseen', split='test', **common)
+
+    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    return (
+        DataLoader(train_ds, shuffle=True, **loader_kwargs),
+        DataLoader(val_ds, shuffle=False, **loader_kwargs),
+        DataLoader(seen_test_ds, shuffle=False, **loader_kwargs),
+        DataLoader(unseen_test_ds, shuffle=False, **loader_kwargs),
+    )
+
+
 def get_dataloaders(root_dir, batch_size=64, signal_len=1024, num_workers=0):
-
-    train_dataset = XJTUGearboxDataset(
-        root_dir=root_dir, 
-        signal_len=signal_len, 
-        stride=signal_len, 
-        mode='seen'
+    """Backward-compatible two-loader view (train and real unseen test)."""
+    train, _, _, unseen = get_temporal_dataloaders(
+        root_dir, batch_size=batch_size, signal_len=signal_len, num_workers=num_workers
     )
-    
-    test_dataset = XJTUGearboxDataset(
-        root_dir=root_dir, 
-        signal_len=signal_len, 
-        stride=signal_len, 
-        mode='unseen'
-    )
+    return train, unseen
 
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers,
-        pin_memory=True 
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers,
-        pin_memory=True
-    )
 
-    return train_loader, test_loader
-
-if __name__ == "__main__":
-
-    if os.path.exists('./dataset/xjtu'):
-        print("Testing optimized loader...")
-        tl, vl = get_dataloaders('./dataset/xjtu', batch_size=32)
-        
-        import time
-        start = time.time()
-        for x, y in tl:
-            pass
-        print(f"Iterate through train loader time: {time.time() - start:.4f}s")
+if __name__ == '__main__':
+    loaders = get_temporal_dataloaders('./dataset/xjtu', batch_size=32)
+    print([len(loader.dataset) for loader in loaders])

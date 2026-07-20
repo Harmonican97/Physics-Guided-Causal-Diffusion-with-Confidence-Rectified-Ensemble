@@ -1,19 +1,21 @@
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, ConcatDataset, random_split, Dataset
+from torch.utils.data import DataLoader, TensorDataset, ConcatDataset
 import numpy as np
+import random
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, accuracy_score
 from sklearn.manifold import TSNE
-import scipy.io as sio
+from hust_data import HUSTTemporalDataset, compute_seen_train_stats
 
 try:
-    from causal_diffusion_model import CausalUNet1D, PhysicsGuidedDiffusion
+    from causal_diffusion_model import CompositionalUNet1D, PhysicsGuidedDiffusion
 except ImportError:
     print("[Error] 'causal_diffusion_model.py' not found. Please ensure it is in the same directory.")
     exit(1)
@@ -23,9 +25,9 @@ INPUT_SPEED_RPM = 1800.0
 SHAFT_FREQ = INPUT_SPEED_RPM / 60.0
 
 COEFFS = {
-    'Ball': 2.35,  
-    'Inner': 5.41, 
-    'Outer': 3.59  
+    'Ball': 1.99,
+    'Inner': 4.94,
+    'Outer': 3.05,
 }
 
 def get_fault_frequencies(task_type):
@@ -41,23 +43,49 @@ def get_fault_frequencies(task_type):
         base_freqs[3] = [COEFFS['Outer'] * f_r, COEFFS['Ball'] * f_r]
     return base_freqs
 
+def _env_int(name, default):
+    return int(os.environ.get(name, default))
+
+
+def _env_float(name, default):
+    return float(os.environ.get(name, default))
+
+
 CONFIG = {
-    'epoch_diffusion': 200, 
-    'epoch_classifier': 60,
-    'batch_size': 64,
+    'epoch_diffusion': _env_int('PGCD_DIFFUSION_EPOCHS', 200),
+    'epoch_classifier': _env_int('PGCD_CLASSIFIER_EPOCHS', 60),
+    'batch_size': _env_int('PGCD_BATCH_SIZE', 64),
     'lr_diffusion': 1e-4,
     'lr_classifier': 5e-4,
     'signal_len': 1024,
-    'overlap_rate': 0.50, 
+    'stride': 1024,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'root_dir': './dataset/hust',
-    'save_dir': './results_gzsl_final',
+    'seed': int(os.environ.get('PGCD_SEED', '0')),
+    'save_dir': f"./results_hust_generation_strict/seed_{os.environ.get('PGCD_SEED', '0')}",
     
     # Generation Params
-    'guidance_scale': 10.0,      
-    'n_synthetic_samples': 800, 
-    'refine_timestep': 150      
+    'guidance_scale': _env_float('PGCD_GUIDANCE_SCALE', 10.0),
+    'n_synthetic_samples': _env_int('PGCD_SYNTHETIC_SAMPLES', 800),
+    'refine_timestep': _env_int('PGCD_REFINE_STEPS', 150),
+    'checkpoint_interval': _env_int('PGCD_CHECKPOINT_INTERVAL', 10),
+    'train_auxiliary_classifier': bool(_env_int('PGCD_TRAIN_AUX_CLASSIFIER', 0)),
 }
+
+TRANSFER_PATH_WEIGHTS = {
+    'IB': [1.5, 2.0],  # [Inner, Ball]
+    'OB': [1.0, 2.0],  # [Outer, Ball]
+}
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def label_to_multihot(labels, device):
@@ -71,10 +99,18 @@ def label_to_multihot(labels, device):
     multihot[mask_outer, 2] = 1.0
     return multihot
 
-def train_diffusion_model(diffusion, train_loader, optimizer, epochs, device):
+def train_diffusion_model(diffusion, train_loader, optimizer, epochs, device, checkpoint_path):
     diffusion.train()
     print(f"\n>>> Diffusion model training...")
-    for epoch in range(epochs):
+    state_path = checkpoint_path.replace('.pth', '_training_state.pt')
+    start_epoch = 0
+    if os.path.exists(state_path):
+        state = torch.load(state_path, map_location=device)
+        diffusion.load_state_dict(state['model'])
+        optimizer.load_state_dict(state['optimizer'])
+        start_epoch = int(state['epoch'])
+        print(f">>> Resuming diffusion at epoch {start_epoch + 1}/{epochs}")
+    for epoch in range(start_epoch, epochs):
         pbar = tqdm(train_loader, desc=f"Diff Epoch {epoch+1}", unit="batch")
         total_loss = 0
         for x, y in pbar:
@@ -88,8 +124,12 @@ def train_diffusion_model(diffusion, train_loader, optimizer, epochs, device):
             optimizer.step()
             total_loss += loss.item()
             pbar.set_postfix({'L': f"{loss.item():.4f}"})
-    
-    torch.save(diffusion.state_dict(), os.path.join(CONFIG['save_dir'], 'causal_diffusion.pth'))
+        if (epoch + 1) % CONFIG['checkpoint_interval'] == 0 or epoch + 1 == epochs:
+            torch.save(
+                {'epoch': epoch + 1, 'model': diffusion.state_dict(), 'optimizer': optimizer.state_dict()},
+                state_path,
+            )
+    torch.save(diffusion.state_dict(), checkpoint_path)
 
 def train_classifier_robust(model, train_loader, optimizer, epochs, device):
     model.train()
@@ -133,40 +173,6 @@ def evaluate_gzsl(model, seen_test_loader, unseen_test_loader, device):
     cm = confusion_matrix(seen_t + unseen_t, seen_p + unseen_p)
     return acc_seen, acc_unseen, h_score, cm
 
-class HUST_Dataset(Dataset):
-    def __init__(self, file_paths, labels, signal_len=1024, overlap_rate=0.5):
-        self.data = []
-        self.labels = []
-        stride = int(signal_len * (1 - overlap_rate))
-        print(f"[Dataset] Loading files. Stride: {stride} (Overlap {overlap_rate*100}%)")
-        
-        for path, label in zip(file_paths, labels):
-            if not os.path.exists(path):
-                continue
-            try:
-                mat = sio.loadmat(path)
-                raw = None
-                for k in ['data', 'Data', 'vibration', 'signal']:
-                    for mk in mat.keys():
-                        if k in mk: raw = mat[mk].flatten(); break
-                    if raw is not None: break
-                if raw is None: # 兜底
-                     for k,v in mat.items():
-                        if isinstance(v, np.ndarray) and v.size > 10000:
-                            raw = v.flatten(); break
-                if raw is None: continue
-                
-                raw = (raw - np.mean(raw)) / (np.std(raw) + 1e-8)
-                for i in range(0, len(raw) - signal_len + 1, stride):
-                    self.data.append(raw[i : i + signal_len])
-                    self.labels.append(label)
-                print(f"  Loaded {os.path.basename(path)} -> Label {label}: {len(self.data)} total samples")
-            except Exception: pass
-
-    def __len__(self): return len(self.data)
-    def __getitem__(self, idx):
-        return torch.tensor(self.data[idx], dtype=torch.float32).unsqueeze(0), torch.tensor(self.labels[idx], dtype=torch.long)
-
 class RobustClassifier(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
@@ -208,8 +214,9 @@ def generate_synthetic_data(diffusion, seen_loader, task_type, device):
     
     x0_coarse = torch.stack(mixed_data)
     refined_data = []
-    batch_size = 32
+    batch_size = CONFIG['batch_size']
     target_freqs = get_fault_frequencies(task_type)[3]
+    target_weights = TRANSFER_PATH_WEIGHTS[task_type]
     
     for i in tqdm(range(0, n_samples, batch_size)):
         x_batch = x0_coarse[i:i+batch_size].to(device)
@@ -220,6 +227,7 @@ def generate_synthetic_data(diffusion, seen_loader, task_type, device):
         target_hot[:, comps[1]] = 1.0
         
         freqs_list = [target_freqs for _ in range(curr_bs)]
+        weights_list = [target_weights for _ in range(curr_bs)]
         
         t_refine = torch.full((curr_bs,), CONFIG['refine_timestep'], device=device, dtype=torch.long)
         noise = torch.randn_like(x_batch)
@@ -232,6 +240,7 @@ def generate_synthetic_data(diffusion, seen_loader, task_type, device):
             x_t, CONFIG['refine_timestep'],
             target_multihot=target_hot,
             target_freqs_list=freqs_list,
+            target_weights_list=weights_list,
             guidance_scale=CONFIG['guidance_scale']
         )
         
@@ -241,36 +250,77 @@ def generate_synthetic_data(diffusion, seen_loader, task_type, device):
 
 
 def run_gzsl_experiment(task_type):
-    CONFIG['save_dir'] = os.path.join('./results_gzsl_final', f'Exp_{task_type}')
+    started_at = time.perf_counter()
+    set_seed(CONFIG['seed'])
+    seed_root = os.path.join('./results_hust_generation_strict', f"seed_{CONFIG['seed']}")
+    CONFIG['save_dir'] = os.path.join(
+        seed_root, f'Exp_{task_type}'
+    )
     os.makedirs(CONFIG['save_dir'], exist_ok=True)
     device = CONFIG['device']
     
     print(f"\n{'='*40}\nStarting GZSL Experiment: Unseen = {task_type}\n{'='*40}")
     
     root = CONFIG['root_dir']
-    seen_files = [os.path.join(root, f'{x}504.mat') for x in ['B', 'I', 'O']]
-    unseen_file = os.path.join(root, f'{task_type}504.mat')
-    
-    seen_ds = HUST_Dataset(seen_files, [0, 1, 2], CONFIG['signal_len'], CONFIG['overlap_rate'])
-    unseen_ds = HUST_Dataset([unseen_file], [3], CONFIG['signal_len'], CONFIG['overlap_rate'])
-    
-    train_sz = int(0.8 * len(seen_ds))
-    seen_train, seen_test = random_split(seen_ds, [train_sz, len(seen_ds)-train_sz], generator=torch.Generator().manual_seed(42))
+    seen_codes = ['B', 'I', 'O']
+    # Use one normalization pair from every seen state, including normal, so
+    # generated candidates and the downstream specialists share the same scale.
+    stats = compute_seen_train_stats(root, ['N', 'B', 'I', 'O'])
+    dataset_args = dict(
+        root_dir=root,
+        class_codes=seen_codes,
+        labels=[0, 1, 2],
+        normalization_stats=stats,
+        signal_len=CONFIG['signal_len'],
+        stride=CONFIG['stride'],
+    )
+    seen_train = HUSTTemporalDataset(split='train', **dataset_args)
+    seen_val = HUSTTemporalDataset(split='val', **dataset_args)
+    seen_test = HUSTTemporalDataset(split='test', **dataset_args)
+    unseen_ds = HUSTTemporalDataset(
+        root_dir=root,
+        class_codes=[task_type],
+        labels=[3],
+        split='test',
+        normalization_stats=stats,
+        signal_len=CONFIG['signal_len'],
+        stride=CONFIG['stride'],
+        unseen=True,
+    )
+    print(
+        'Strict temporal counts (train/val/seen-test/unseen-test):',
+        len(seen_train), len(seen_val), len(seen_test), len(unseen_ds),
+    )
     
     seen_train_loader = DataLoader(seen_train, batch_size=CONFIG['batch_size'], shuffle=True)
     seen_test_loader = DataLoader(seen_test, batch_size=CONFIG['batch_size'], shuffle=False)
     unseen_test_loader = DataLoader(unseen_ds, batch_size=CONFIG['batch_size'], shuffle=False)
     
-    unet = CausalUNet1D(num_fault_components=3)
-    diffusion = PhysicsGuidedDiffusion(unet, device=device)
+    unet = CompositionalUNet1D(num_fault_components=3)
+    diffusion = PhysicsGuidedDiffusion(
+        unet,
+        device=device,
+        fs=FS,
+        physics_bandwidth_hz=FS / CONFIG['signal_len'],
+        physics_harmonics=3,
+    )
     
-    diff_path = os.path.join(CONFIG['save_dir'], 'causal_diffusion.pth')
-    if os.path.exists(diff_path):
+    diff_path = os.path.join(seed_root, 'compositional_diffusion.pth')
+    legacy_diff_path = os.path.join(seed_root, 'causal_diffusion.pth')
+    training_state_path = diff_path.replace('.pth', '_training_state.pt')
+    completed_epochs = 0
+    if os.path.exists(training_state_path):
+        completed_epochs = int(torch.load(training_state_path, map_location='cpu')['epoch'])
+    if (os.path.exists(diff_path) or os.path.exists(legacy_diff_path)) and completed_epochs >= CONFIG['epoch_diffusion']:
         print(">>> Loading pre-trained Diffusion...")
-        diffusion.load_state_dict(torch.load(diff_path))
+        diffusion.load_state_dict(torch.load(
+            diff_path if os.path.exists(diff_path) else legacy_diff_path, map_location=device
+        ))
     else:
         optimizer = optim.Adam(diffusion.parameters(), lr=CONFIG['lr_diffusion'])
-        train_diffusion_model(diffusion, seen_train_loader, optimizer, CONFIG['epoch_diffusion'], device)
+        train_diffusion_model(
+            diffusion, seen_train_loader, optimizer, CONFIG['epoch_diffusion'], device, diff_path
+        )
         
     syn_path = os.path.join(CONFIG['save_dir'], 'synthetic_data.pt')
     if os.path.exists(syn_path):
@@ -279,6 +329,18 @@ def run_gzsl_experiment(task_type):
     else:
         synthetic_ds = generate_synthetic_data(diffusion, seen_train_loader, task_type, device)
         torch.save(synthetic_ds, syn_path)
+
+    with open(os.path.join(CONFIG['save_dir'], 'generation_summary.txt'), 'w', encoding='utf-8') as handle:
+        handle.write(f"task={task_type}\n")
+        handle.write(f"seed={CONFIG['seed']}\n")
+        handle.write(f"synthetic_samples={len(synthetic_ds)}\n")
+        handle.write(f"runtime_seconds={time.perf_counter() - started_at:.6f}\n")
+        handle.write(f"normalization_mean={stats[0]:.12g}\n")
+        handle.write(f"normalization_std={stats[1]:.12g}\n")
+
+    if not CONFIG['train_auxiliary_classifier']:
+        print(">>> Candidate generation complete; auxiliary direct classifier disabled.")
+        return
 
     classifier = RobustClassifier(num_classes=4).to(device)
     full_ds = ConcatDataset([seen_train, synthetic_ds])
