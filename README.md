@@ -1,62 +1,69 @@
-# Physics-Guided-Causal-Diffusion-with-Confidence-Rectified-Ensemble
+# Physics-Guided Compositional Diffusion with Confidence-Rectified Ensemble
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-1.10+-ee4c2c.svg)](https://pytorch.org/)
-[![GZSL](https://img.shields.io/badge/Task-Generalized%20Zero--Shot%20Learning-green.svg)]()
+PyTorch implementation of PGCD-CRE for generalized zero-shot compound-fault diagnosis.
 
-Official PyTorch implementation of the paper: 
-**Physics-Guided Compositional Diffusion with Confidence-Rectified Ensemble for Generalized Zero-Shot Compound Fault Diagnosis**
-## 📝 Abstract
+The term **compositional** is deliberate. Multi-hot vectors specify constituent fault modes; the method does not implement a structural causal model, interventions, or counterfactual inference.
 
-Generalized Zero-Shot Learning (GZSL) in machinery fault diagnosis aims to identify novel compound faults (unseen) using only single-fault data (seen). Traditional generative methods often fail to capture the physical coupling of fault signatures, leading to poor generalization.
+## Problem boundary
 
-We propose **PGCD-CRE**, a novel framework that bridges the semantic gap through physical causality.
-Key innovations include:
-1.  **Physics-Guided Causal Diffusion:** Generates high-fidelity unseen compound fault signals by enforcing physical envelope constraints and multi-hot causal conditioning.
-2.  **Specialist Ensemble Diagnosis:** A diagnostic strategy with Cross-Confidence Rectification to resolve spectral confusion between similar compound faults (e.g., Inner-Ball vs. Outer-Ball).
+- A candidate compound-fault semantic dictionary is defined before deployment.
+- One specialist is trained for each candidate semantic.
+- The number and identity of candidate categories active in a test batch are not supplied.
+- HDBSCAN discovers the batch cluster structure; validation-only candidate thresholds resolve density-noise points, while unsupported coherent clusters may be rejected.
+- CRE maps supported clusters to candidate semantics; it does not discover arbitrary new semantics.
+- Real compound-fault test signals are never used for training, normalization, or threshold calibration.
 
-![Framework](assets/framework.png)
+## Reproducibility-critical protocol
 
-## 📖 Overview
-This repository contains the code for the **PGCD-CRE** framework, a novel generative approach for Generalized Zero-Shot Learning (GZSL) in industrial rotating machinery. The framework synthesizes high-fidelity compound fault signals using a **Physics-Guided Causal Diffusion Model (PGCD)** and employs a **Cross-Confidence Rectification Ensemble (CRE)** to mitigate domain shifts during diagnosis.
+Both datasets are split chronologically **before** windowing:
 
-## 📂 Repository Structure
+1. first 60% of each seen trace: training;
+2. next 20%: validation;
+3. final 20%: testing;
+4. window length and stride: 1024 (no overlap);
+5. one mean/std pair is computed from seen training blocks only and reused everywhere;
+6. real compound traces expose only their final 20% test block.
+
+The old random-window split is not used by the revised loaders.
+
+## Physics guidance
+
+`causal_diffusion_model.py` retains its historical filename for compatibility, but its primary model class is `CompositionalUNet1D`.
+
+The sampling loss uses:
+
+- a differentiable Hilbert envelope;
+- envelope demeaning and a Hann window;
+- an orthonormal one-sided power spectrum;
+- bandwidth `fs / 1024` around three harmonics;
+- fixed raw transfer-path coefficients `[BSF=2.0, BPFI=1.5, BPFO=1.0]`, normalized over active components;
+- epsilon `1e-8` and guidance scale `s=10`.
+
+The coefficients are fixed before training and do not use real unseen test data.
+
+## Repository layout
+
 ```text
 .
-├── dataset/
-│   ├── xjtu/                   # Place XJTU planetary gearbox dataset here
-│   └── hust/                   # Place HUST bearing dataset here
-├── causal_diffusion_model.py   # PGCD model file
-├── data_loader.py              # Data loader for XJTU and HUST
-├── main_gzsl_xjtu.py           # End-to-end training & evaluation for XJTU dataset
-├── main_gzsl_hust.py           # PGCD generation phase for HUST dataset
-├── hust_gzsl_sp_model.py       # Specialist model training for HUST dataset
-├── hust_gzsl_sp_model_confidence.py # Final evaluation with CRE strategy for HUST
-└── README.md                   # This documentation
-
+├── causal_diffusion_model.py       # Compositional U-Net, DDPM, physics loss
+├── data_loader.py                  # Strict temporal XJTU loader
+├── hust_data.py                    # Shared strict temporal HUST loader
+├── main_gzsl_xjtu.py               # XJTU generation/training/evaluation
+├── main_gzsl_hust.py               # HUST candidate generation
+├── hust_gzsl_sp_model.py           # IB/OB specialist training
+├── hust_gzsl_sp_model_confidence.py# HDBSCAN + CRE + per-class metrics
+└── requirements.txt
 ```
 
-## 💾 Data Preparation
+## Data layout
 
-### 1. XJTU Gearbox Dataset
-Download the dataset from the XJTU Website and organize files as follows:
-
-```bash
+```text
 dataset/xjtu/
-├── 1ndBearing_ball/ 
-│   └── Data_Chan1.txt
-├── 1ndBearing_inner/ 
-│   └── Data_Chan1.txt
-├── 1ndBearing_outer/ 
-│   └── Data_Chan1.txt
-└── 1ndBearing_mix(inner+outer+ball)/ 
-    └── Data_Chan1.txt
-```
-### 2. HUST Bearing Dataset
-Download the dataset and organize files as follows:
+├── 1ndBearing_ball/Data_Chan1.txt
+├── 1ndBearing_inner/Data_Chan1.txt
+├── 1ndBearing_outer/Data_Chan1.txt
+└── 1ndBearing_mix(inner+outer+ball)/Data_Chan1.txt
 
-```bash
 dataset/hust/
 ├── N504.mat
 ├── B504.mat
@@ -66,64 +73,54 @@ dataset/hust/
 └── OB504.mat
 ```
 
-## ⚙️ Requirements
+The present experiment workspace contains the raw records in the paths above. Before public redistribution, verify the original dataset licenses; users of a source-only release must obtain the records from their original providers.
 
-To install the required dependencies, run the following command or ensure your environment has these packages installed:
+## Environment
 
 ```bash
-pip install torch torchvision torchaudio numpy scipy scikit-learn matplotlib seaborn tqdm
+python -m venv .venv
+.venv/Scripts/activate
+pip install -r requirements.txt
 ```
 
-## 🚀 Usage
+HDBSCAN is provided by `scikit-learn>=1.3`.
 
-### 1. XJTU Dataset Experiment
+## Run
 
-To train the PGCD model and the robust classifier for the complex compound fault diagnosis (e.g., Inner + Outer + Ball) on the XJTU dataset, run:
+XJTU:
 
 ```bash
 python main_gzsl_xjtu.py
 ```
 
-**Expected Pipeline:**
-
-1. Loads the seen single-fault data from `./dataset/xjtu`.
-2. Trains the physics-guided diffusion model (`causal_diffusion_model.py`).
-3. Generates refined synthetic compound fault samples using explicit kinematic constraints.
-4. Trains the robust classifier on the mixed dataset (Real Seen + Synthetic Unseen).
-5. **Outputs:** Prints `Seen Acc`, `Unseen Acc`, and `H-score` to the console and generates the confusion matrix plot.
-
----
-
-### 2. HUST Dataset Experiment
-
-The HUST bearing dataset evaluation involves a three-step pipeline designed to validate the **Cross-Confidence Rectified Ensemble (CRE)** strategy for multiple unseen compound faults.
-
-**Step 2.1: Train PGCD and Generate Synthetic Data**
-First, train the diffusion model to synthesize high-fidelity compound fault data for the unseen classes:
+HUST:
 
 ```bash
 python main_gzsl_hust.py
-```
-
-*(This script saves the generated synthetic tensors to the `./results_gzsl_final` directory.)*
-
-**Step 2.2: Train the Specialist Models**
-Next, train the individual specialist classifiers on their respective fault domains:
-
-```bash
 python hust_gzsl_sp_model.py
-```
-
-*(This script trains and saves the specialist model weights to the `./results_gzsl_ensemble` directory.)*
-
-**Step 2.3: Evaluate with Confidence-Rectified Ensemble**
-Finally, execute the CRE strategy to perform the global zero-shot diagnosis and rectify confidence biases:
-
-```bash
 python hust_gzsl_sp_model_confidence.py
 ```
 
-**Expected Outputs:** The script will print the final `Seen Acc`, `Unseen Acc`, and `H-score` metrics. It will also generate and save the refined Confusion Matrix (`conf_cm.png`) and t-SNE visualizations in the `./results_gzsl_confidence` directory.
+The final HUST script calibrates the seen threshold on the real seen validation block and the candidate threshold on held-out synthetic validation samples. It writes:
 
+- `metrics.json`;
+- `per_class_metrics.csv`;
+- `conf_cm.png`;
+- `conf_tsne.png`.
 
+## Repeated-seed evaluation
 
+Every entry point reads the `PGCD_SEED` environment variable and writes to a separate checkpoint namespace. The revised manuscript reports the completed seeds explicitly rather than assuming that a fixed number of runs exists. For example, to reproduce the current three-seed protocol in PowerShell:
+
+```powershell
+0..2 | ForEach-Object {
+    $env:PGCD_SEED = $_
+    python main_gzsl_xjtu.py
+}
+```
+
+Do not reuse checkpoints generated by the old random-window protocol when reporting revised results.
+
+## Current revision note
+
+The strict-protocol runs write structured metrics below `results_xjtu_strict/` and `results_hust_confidence_strict/`. Use `distribution_audit.py` for evaluation-only temporal-drift and synthetic--real MMD diagnostics, and `aggregate_results.py` to regenerate mean, sample standard deviation, and per-class summaries from completed seeds. Smoke-test seed 999 and explicitly marked diagnostic artifacts are excluded from manuscript statistics.
