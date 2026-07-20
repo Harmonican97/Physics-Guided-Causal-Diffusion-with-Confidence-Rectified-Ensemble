@@ -6,8 +6,7 @@
 [![GZSL](https://img.shields.io/badge/Task-Generalized%20Zero--Shot%20Learning-green.svg)]()
 
 Official PyTorch implementation of the paper: 
-**Physics-Guided Causal Diffusion with Confidence-Rectified Ensemble for Generalized Zero-Shot Compound Fault Diagnosis** *Submitted to IEEE Transactions on Industrial Informatics*
-
+**Physics-Guided Causal Diffusion with Confidence-Rectified Ensemble for Generalized Zero-Shot Compound Fault Diagnosis**
 ## 📝 Abstract
 
 Generalized Zero-Shot Learning (GZSL) in machinery fault diagnosis aims to identify novel compound faults (unseen) using only single-fault data (seen). Traditional generative methods often fail to capture the physical coupling of fault signatures, leading to poor generalization.
